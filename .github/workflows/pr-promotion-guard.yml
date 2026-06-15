@@ -3,6 +3,7 @@ name: PR Promotion Guard
 on:
   pull_request:
     branches:
+      - staging
       - preprod
       - main
     types: [opened, reopened, edited, synchronize]
@@ -20,17 +21,40 @@ jobs:
           HEAD: ${{ github.head_ref }}   # source branch
         run: |
           echo "PR: $HEAD → $BASE"
+
+          # --- Hotfix exception -------------------------------------------
+          # hotfix/* may target ANY protected branch directly.
+          # This covers emergency prod fixes AND the required back-merges
+          # into the lower branches (preprod, staging).
+          case "$HEAD" in
+            hotfix/*)
+              echo "✅ Hotfix exception: '$HEAD' → '$BASE' allowed."
+              exit 0 ;;
+          esac
+
+          # --- Normal promotion rules -------------------------------------
           case "$BASE" in
-            preprod)
-              ALLOWED="staging" ;;
             main)
               ALLOWED="preprod" ;;
+            preprod)
+              ALLOWED="staging" ;;
+            staging)
+              # staging is the entry point: any feature/fix branch is fine,
+              # but downstream branches must not flow back via a normal PR.
+              case "$HEAD" in
+                preprod|main)
+                  echo "::error::'staging' must not receive PRs from '$HEAD' (use a hotfix/* branch for back-merges)."
+                  exit 1 ;;
+                *)
+                  echo "✅ '$HEAD' → staging allowed."
+                  exit 0 ;;
+              esac ;;
             *)
-              echo "No promotion rule for base '$BASE'"; exit 0 ;;
+              echo "No promotion rule for base '$BASE'."; exit 0 ;;
           esac
 
           if [ "$HEAD" != "$ALLOWED" ]; then
-            echo "::error::Invalid promotion. '$BASE' only accepts PRs from '$ALLOWED', but got '$HEAD'."
+            echo "::error::Invalid promotion. '$BASE' only accepts PRs from '$ALLOWED' (or hotfix/*), but got '$HEAD'."
             echo "Respect the flow: staging → preprod → main."
             exit 1
           fi
