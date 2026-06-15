@@ -13,6 +13,13 @@ permissions:
 
 jobs:
   validate-promotion-flow:
+    # The check-run name is keyed to the TARGET branch so that two PRs sharing
+    # the same head commit (e.g. one feature branch opened into both staging and
+    # main) produce DISTINCT check runs. Without this, GitHub dedups by name on
+    # the shared SHA and the latest run's result bleeds across both PRs' merge
+    # gates — letting a passing "→ staging" run mark an invalid "→ main" PR as
+    # mergeable. Distinct names give each PR its own independent required check.
+    name: promotion-guard-${{ github.base_ref }}
     runs-on: ubuntu-latest
     steps:
       - name: Enforce promotion flow (staging → preprod → main)
