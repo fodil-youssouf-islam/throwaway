@@ -1,0 +1,37 @@
+name: PR Promotion Guard
+
+on:
+  pull_request:
+    branches:
+      - preprod
+      - main
+    types: [opened, reopened, edited, synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  validate-promotion-flow:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce promotion flow (staging → preprod → main)
+        env:
+          BASE: ${{ github.base_ref }}   # target branch
+          HEAD: ${{ github.head_ref }}   # source branch
+        run: |
+          echo "PR: $HEAD → $BASE"
+          case "$BASE" in
+            preprod)
+              ALLOWED="staging" ;;
+            main)
+              ALLOWED="preprod" ;;
+            *)
+              echo "No promotion rule for base '$BASE'"; exit 0 ;;
+          esac
+
+          if [ "$HEAD" != "$ALLOWED" ]; then
+            echo "::error::Invalid promotion. '$BASE' only accepts PRs from '$ALLOWED', but got '$HEAD'."
+            echo "Respect the flow: staging → preprod → main."
+            exit 1
+          fi
+          echo "✅ Valid promotion: $HEAD → $BASE"
