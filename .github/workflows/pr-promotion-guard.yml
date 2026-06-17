@@ -26,18 +26,43 @@ jobs:
         env:
           BASE: ${{ github.base_ref }}   # target branch
           HEAD: ${{ github.head_ref }}   # source branch
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
         run: |
           echo "PR: $HEAD → $BASE"
 
           # --- Hotfix exception -------------------------------------------
           # hotfix/* may target ANY protected branch directly.
-          # This covers emergency prod fixes AND the required back-merges
-          # into the lower branches (preprod, staging).
           case "$HEAD" in
             hotfix/*)
               echo "✅ Hotfix exception: '$HEAD' → '$BASE' allowed."
               exit 0 ;;
           esac
+
+          # --- Automated downstream sync (branch-synchronization.yml) -----
+          # Allows main→preprod and preprod→staging ONLY for bot-created sync PRs.
+          # Human back-flow PRs without these signals remain blocked.
+          IS_SYNC=false
+          if [ "$PR_AUTHOR" = "github-actions[bot]" ]; then IS_SYNC=true; fi
+          if echo "$PR_TITLE" | grep -q '\[AUTO-PR\]'; then IS_SYNC=true; fi
+          if echo "$PR_LABELS" | grep -qE 'branch-sync|sync-pr'; then IS_SYNC=true; fi
+          if [ "$IS_SYNC" = "true" ]; then
+            case "$BASE" in
+              preprod)
+                if [ "$HEAD" = "main" ]; then
+                  echo "✅ Automated downstream sync: main → preprod"
+                  exit 0
+                fi ;;
+              staging)
+                if [ "$HEAD" = "preprod" ]; then
+                  echo "✅ Automated downstream sync: preprod → staging"
+                  exit 0
+                fi ;;
+            esac
+            echo "::error::Sync PR detected but invalid pairing '$HEAD' → '$BASE'."
+            exit 1
+          fi
 
           # --- Normal promotion rules -------------------------------------
           case "$BASE" in
