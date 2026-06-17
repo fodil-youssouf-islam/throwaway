@@ -164,15 +164,13 @@ jobs:
         run: |
           set -euo pipefail
           FIRST_LINE=$(git log -1 --pretty=%s "${GITHUB_SHA}" 2>/dev/null || echo "sync")
-          export TITLE="[AUTO-PR] Sync ${SRC} to ${DST}"
-          export BODY="Automated downstream sync ${SRC} to ${DST}. Commit: ${FIRST_LINE} (${GITHUB_SHA})"
-          PAYLOAD=$(python3 -c 'import json,os; print(json.dumps({"title":os.environ["TITLE"],"body":os.environ["BODY"],"head":os.environ["SRC"],"base":os.environ["DST"],"draft":False}))')
           RESP=$(curl -sS -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/pulls" -d "$PAYLOAD")
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/pulls" \
+            -d "{\"title\":\"[AUTO-PR] Sync ${SRC} to ${DST}\",\"body\":\"Downstream sync. ${FIRST_LINE} (${GITHUB_SHA})\",\"head\":\"${SRC}\",\"base\":\"${DST}\"}")
           PR_NUMBER=$(echo "$RESP" | jq -r '.number // empty')
           PR_URL=$(echo "$RESP" | jq -r '.html_url // empty')
           if [ -z "$PR_NUMBER" ]; then
-            echo "PR create failed: $(echo "$RESP" | jq -r '.message')"
+            echo "PR create failed: $(echo "$RESP" | jq -r '.message // .errors // .')"
             echo "$RESP" | jq .
             exit 1
           fi
@@ -180,7 +178,7 @@ jobs:
           echo "pr_url=${PR_URL}" >> "$GITHUB_OUTPUT"
           curl -sS -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/labels" \
-            -d "$(jq -n --arg env "$ENVIRONMENT" '{labels:["auto-generated","sync-pr","branch-sync",$env]}')" >/dev/null || true
+            -d '{"labels":["auto-generated","sync-pr","branch-sync"]}' >/dev/null || true
 
       - name: Auto-merge PR
         if: steps.target.outputs.skip_reason == '' && steps.diff-check.outputs.diff == 'true' && steps.check-pr.outputs.pr_exists == 'false' && steps.target.outputs.dry_run != 'true' && steps.create_pr.outcome == 'success'
