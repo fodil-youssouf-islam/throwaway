@@ -163,13 +163,12 @@ jobs:
           ENVIRONMENT: ${{ steps.target.outputs.environment }}
         run: |
           set -euo pipefail
-          FIRST_LINE=$(git log -1 --pretty=%s "${GITHUB_SHA}")
-          TITLE="[AUTO-PR] Sync ${SRC} to ${DST}: ${FIRST_LINE:0:200}"
-          BODY="Automated downstream sync: ${SRC} to ${DST}. Commit: ${FIRST_LINE} (${GITHUB_SHA})"
+          FIRST_LINE=$(git log -1 --pretty=%s "${GITHUB_SHA}" 2>/dev/null || echo "sync")
+          export TITLE="[AUTO-PR] Sync ${SRC} to ${DST}"
+          export BODY="Automated downstream sync ${SRC} to ${DST}. Commit: ${FIRST_LINE} (${GITHUB_SHA})"
+          PAYLOAD=$(python3 -c 'import json,os; print(json.dumps({"title":os.environ["TITLE"],"body":os.environ["BODY"],"head":os.environ["SRC"],"base":os.environ["DST"],"draft":False}))')
           RESP=$(curl -sS -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/pulls" \
-            -d "$(jq -n --arg t "$TITLE" --arg b "$BODY" --arg h "$SRC" --arg base "$DST" \
-              '{title:$t, body:$b, head:$h, base:$base, draft:false}')")
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/pulls" -d "$PAYLOAD")
           PR_NUMBER=$(echo "$RESP" | jq -r '.number // empty')
           PR_URL=$(echo "$RESP" | jq -r '.html_url // empty')
           if [ -z "$PR_NUMBER" ]; then
