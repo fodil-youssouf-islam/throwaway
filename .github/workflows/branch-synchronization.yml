@@ -1,0 +1,245 @@
+name: Branch Sync Automation
+
+# Cascading sync across permanent environment branches:
+#   main → preprod → staging
+#
+# Triggered when something lands on main or preprod (e.g. hotfix merge).
+# Uses workflow_dispatch to chain main→preprod merge into preprod→staging,
+# because GITHUB_TOKEN merges do not re-fire push workflows.
+
+on:
+  push:
+    branches:
+      - main
+      - preprod
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "If true, run all checks but do not create PRs or merge."
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    if: ${{ (github.event_name == 'push' && github.event.head_commit != null) || github.event_name == 'workflow_dispatch' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Configure git user
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Resolve target and skip conditions
+        id: target
+        run: |
+          set -euo pipefail
+
+          SRC="${GITHUB_REF_NAME}"
+          DRY_RUN="${{ github.event.inputs.dry_run || 'false' }}"
+          SKIP_REASON=""
+
+          echo "source=${SRC}" >> "$GITHUB_OUTPUT"
+          echo "dry_run=${DRY_RUN}" >> "$GITHUB_OUTPUT"
+
+          if [[ "${SRC}" == "main" ]]; then
+            DST="preprod"
+            ENVIRONMENT="preprod"
+            EMOJI="🚀"
+          elif [[ "${SRC}" == "preprod" ]]; then
+            DST="staging"
+            ENVIRONMENT="staging"
+            EMOJI="🧪"
+          else
+            echo "Unsupported source branch: ${SRC}"
+            exit 1
+          fi
+
+          echo "branch=${DST}" >> "$GITHUB_OUTPUT"
+          echo "environment=${ENVIRONMENT}" >> "$GITHUB_OUTPUT"
+          echo "emoji=${EMOJI}" >> "$GITHUB_OUTPUT"
+
+          COMMIT_MSG="$(git log -1 --pretty=%B "${GITHUB_SHA}" 2>/dev/null || echo '')"
+          COMMIT_URL="https://github.com/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}"
+
+          {
+            echo "commit_message<<COMMITEOF"
+            echo "${COMMIT_MSG}"
+            echo "COMMITEOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "commit_url=${COMMIT_URL}" >> "$GITHUB_OUTPUT"
+
+          MERGE_SRC=""
+          if echo "${COMMIT_MSG}" | grep -qiE "Merge pull request #[0-9]+ from"; then
+            MERGE_SRC_RAW=$(echo "${COMMIT_MSG}" | sed -nE "s/.*from[[:space:]]+([[:alnum:]_./-]+).*/\1/p" || true)
+            MERGE_SRC=$(echo "${MERGE_SRC_RAW}" | awk -F'/' '{print $NF}')
+          elif echo "${COMMIT_MSG}" | grep -qiE "Merge branch '"; then
+            MERGE_SRC=$(echo "${COMMIT_MSG}" | sed -nE "s/.*Merge branch[[:space:]]+'([^']+)'.*/\1/p" || true)
+          fi
+
+          if [ -n "${MERGE_SRC}" ]; then
+            echo "merge_from=${MERGE_SRC}" >> "$GITHUB_OUTPUT"
+            if [[ "${MERGE_SRC}" == "${DST}" ]]; then
+              echo "Back-merge detected — skipping to avoid cyclic sync."
+              SKIP_REASON="back_merge"
+            fi
+          fi
+
+          echo "skip_reason=${SKIP_REASON}" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch remote branches
+        if: steps.target.outputs.skip_reason == ''
+        run: |
+          git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          git fetch --no-tags --prune origin +refs/heads/*:refs/remotes/origin/*
+
+      - name: Check for differences between source and target
+        if: steps.target.outputs.skip_reason == ''
+        id: diff-check
+        run: |
+          set -euo pipefail
+          SRC="${GITHUB_REF_NAME}"
+          DST="${{ steps.target.outputs.branch }}"
+
+          if ! git rev-parse --verify "origin/${DST}" >/dev/null 2>&1; then
+            echo "target_missing=true" >> "$GITHUB_OUTPUT"
+            echo "diff=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if git merge-base --is-ancestor "origin/${SRC}" "origin/${DST}" >/dev/null 2>&1; then
+            echo "diff=false" >> "$GITHUB_OUTPUT"
+            echo "Destination already contains source commits."
+            exit 0
+          fi
+
+          if git diff --quiet "origin/${DST}..origin/${SRC}"; then
+            echo "diff=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "diff=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check for existing PR (SRC → DST)
+        if: steps.target.outputs.skip_reason == '' && steps.diff-check.outputs.diff == 'true'
+        id: check-pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          EXISTING_PR_NUMBER=$(gh pr list --base "${{ steps.target.outputs.branch }}" --head "${{ github.ref_name }}" --state open --json number --jq '.[0].number // empty' || true)
+          if [ -n "$EXISTING_PR_NUMBER" ]; then
+            echo "pr_exists=true" >> "$GITHUB_OUTPUT"
+            echo "pr_number=$EXISTING_PR_NUMBER" >> "$GITHUB_OUTPUT"
+            echo "pr_url=https://github.com/${{ github.repository }}/pull/${EXISTING_PR_NUMBER}" >> "$GITHUB_OUTPUT"
+          else
+            echo "pr_exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create Auto PR
+        if: steps.target.outputs.skip_reason == '' && steps.diff-check.outputs.diff == 'true' && steps.check-pr.outputs.pr_exists == 'false' && steps.target.outputs.dry_run != 'true'
+        id: create_pr
+        uses: actions/github-script@v7
+        env:
+          HEAD_COMMIT_MSG: ${{ steps.target.outputs.commit_message }}
+          HEAD_COMMIT_URL: ${{ steps.target.outputs.commit_url }}
+          TARGET_ENV: ${{ steps.target.outputs.environment }}
+          TARGET_EMOJI: ${{ steps.target.outputs.emoji }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const src = context.ref.replace('refs/heads/', '');
+            const dst = "${{ steps.target.outputs.branch }}";
+            const environment = process.env.TARGET_ENV;
+            const emoji = process.env.TARGET_EMOJI;
+            const commitMsg = (context.payload.head_commit?.message) || process.env.HEAD_COMMIT_MSG || '';
+            const commitUrl = (context.payload.head_commit?.url) || process.env.HEAD_COMMIT_URL || '';
+            const actor = context.actor;
+            const commitSha = context.sha;
+            const firstLine = commitMsg.split('\n')[0] || `Sync ${src} → ${dst}`;
+
+            const body = [
+              '## 🤖 Automated Pull Request',
+              '',
+              `Downstream sync: **${src}** → **${dst}**`,
+              '',
+              `- **Commit:** [${firstLine}](${commitUrl})`,
+              `- **SHA:** \`${commitSha}\``,
+              `- **Author:** @${actor}`,
+              '',
+              '*Generated by Branch Sync Automation.*'
+            ].join('\n');
+
+            const { data: pr } = await github.rest.pulls.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              head: src,
+              base: dst,
+              title: `${emoji} [AUTO-PR] Sync ${src} to ${dst}: ${firstLine.substring(0, 200)}`,
+              body,
+              draft: false
+            });
+
+            core.setOutput('pr_number', pr.number);
+            core.setOutput('pr_url', pr.html_url);
+
+            try {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                labels: ['auto-generated', 'sync-pr', 'branch-sync', environment]
+              });
+            } catch (error) {
+              console.log('Could not add labels:', error.message);
+            }
+
+      - name: Auto-merge PR
+        if: steps.target.outputs.skip_reason == '' && steps.diff-check.outputs.diff == 'true' && steps.check-pr.outputs.pr_exists == 'false' && steps.target.outputs.dry_run != 'true' && steps.create_pr.outcome == 'success'
+        id: auto-merge
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.create_pr.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+          [ -n "${PR_NUMBER}" ] || { echo "outcome=missing_pr" >> "$GITHUB_OUTPUT"; exit 0; }
+
+          sleep 8
+          PR_INFO=$(gh pr view "${PR_NUMBER}" --json mergeable,mergeStateStatus --jq '.')
+          MERGEABLE=$(echo "${PR_INFO}" | jq -r '.mergeable // empty')
+          MERGESTATUS=$(echo "${PR_INFO}" | jq -r '.mergeStateStatus // empty')
+
+          MERGE_OUTCOME="manual_review"
+          if [ "${MERGEABLE}" = "MERGEABLE" ] || [ "${MERGEABLE}" = "true" ]; then
+            case "${MERGESTATUS}" in
+              CLEAN|"")
+                gh pr merge "${PR_NUMBER}" --merge --body "Auto-merged by Branch Sync Action" --delete-branch=false && MERGE_OUTCOME="merged" || MERGE_OUTCOME="manual_review"
+                ;;
+              BLOCKED)
+                gh pr merge "${PR_NUMBER}" --auto --merge --body "Auto-merged by Branch Sync Action" --delete-branch=false && MERGE_OUTCOME="queued" || MERGE_OUTCOME="manual_review"
+                ;;
+              *) MERGE_OUTCOME="manual_review" ;;
+            esac
+          fi
+          echo "outcome=${MERGE_OUTCOME}" >> "$GITHUB_OUTPUT"
+          echo "Merge outcome: ${MERGE_OUTCOME}"
+
+      - name: Dispatch next hop (main → preprod done, sync staging)
+        if: steps.target.outputs.source == 'main' && steps.auto-merge.outputs.outcome == 'merged' && steps.target.outputs.dry_run != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "main → preprod merged; dispatching preprod → staging sync"
+          gh workflow run branch-synchronization.yml --ref preprod || echo "::warning::Cascade dispatch failed — run manually on preprod"
